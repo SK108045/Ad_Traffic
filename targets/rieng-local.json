@@ -1,0 +1,25 @@
+{
+  "name": "RIENG Radio local app",
+  "baseURL": "http://127.0.0.1:3000/",
+  "allowedOrigins": [],
+  "routes": {
+    "home": "/",
+    "shows": "/shows",
+    "trending": "/trending",
+    "videos": "/videos"
+  },
+  "selectors": {
+    "ready": "main",
+    "play": "#live-player button[aria-label=\"Play live radio\"], #live-player button[aria-label=\"Pause live radio\"]",
+    "playerState": "#live-player [role=\"status\"]",
+    "menu": "button[aria-label=\"Toggle menu\"]",
+    "navigation": "a[href=\"/shows\"]:visible",
+    "shows": "a[href=\"/shows\"]:visible",
+    "trending": "a[href=\"/trending\"]:visible",
+    "videos": "a[href=\"/videos\"]:visible"
+  },
+  "expected": {
+    "playing": "You’re tuned in. Enjoy the vibes.",
+    "stopped": "Press play. Find your frequency."
+  }
+}
