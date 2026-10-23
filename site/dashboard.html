@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Device Lab — Dashboard</title>
+  <style>
+    :root{color-scheme:dark;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#090b10;color:#f4f5f8}*{box-sizing:border-box}
+    body{margin:0}main{max-width:1160px;margin:auto;padding:3rem 1.25rem}h1{font-size:clamp(2rem,5vw,3.5rem);letter-spacing:-.055em;margin:.2rem 0 1rem}
+    .sub{color:#a9afbd;line-height:1.6}.top{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+    .badge{font-size:.72rem;border:1px solid #315a4d;color:#8ae5bf;padding:.4rem .75rem;border-radius:50px}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:2rem 0}.metric,.panel{background:#131720;border:1px solid #303745;border-radius:16px;padding:1.4rem}
+    .metric strong{font-size:2.5rem;display:block;line-height:1.2;margin-top:.5rem}.label{color:#a5adbd;font-size:.8rem}
+    .columns{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.panel h2{margin:0 0 1.3rem;font-size:1.1rem}
+    .bar-row{margin:1rem 0}.bar-label{display:flex;justify-content:space-between;color:#bbc3d2;font-size:.84rem;margin-bottom:.35rem}.track{height:10px;border-radius:20px;background:#272d38;overflow:hidden}.fill{height:100%;background:linear-gradient(90deg,#ff713f,#ffb46b);border-radius:20px}
+    table{width:100%;border-collapse:collapse;font-size:.83rem}th{text-align:left;color:#8e98ad;font-weight:600}td,th{padding:.8rem;border-bottom:1px solid #29303b}td{word-break:break-word}.table-wrap{overflow-x:auto}.subtle{color:#98a2b4}
+    @media(max-width:720px){.grid{grid-template-columns:1fr}.columns{grid-template-columns:1fr}}
+  </style>
+</head>
+<body><main>
+  <div class="top"><div><p class="label">LOCAL TRAFFIC RESEARCH</p><h1>Device lab dashboard</h1></div><span class="badge">● SYNTHETIC EVENTS ONLY</span></div>
+  <p class="sub">Explore claimed device identities versus observed connection data. Auto-updates every two seconds. No production advertising metrics are collected.</p>
+  <div class="grid"><div class="metric"><span class="label">Events received</span><strong id="events">—</strong></div><div class="metric"><span class="label">Virtual sessions</span><strong id="sessions">—</strong></div><div class="metric"><span class="label">Observed IPs</span><strong id="ips">—</strong></div></div>
+  <div class="columns"><section class="panel"><h2>Claimed device types</h2><div id="devices"></div></section><section class="panel"><h2>Recorded actions</h2><div id="actions"></div></section></div>
+  <section class="panel" style="margin-top:1rem"><h2>Latest events</h2><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Session</th><th>Claimed device</th><th>Observed IP</th><th>Action</th><th>Page</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+  <p class="sub" id="status">Waiting for local lab events…</p>
+</main><script>
+  const $ = id => document.getElementById(id);
+  function bars(target, counts) {
+    target.replaceChildren(); const entries = Object.entries(counts), max = Math.max(1,...entries.map(([,n])=>n));
+    if(!entries.length){target.textContent='No events yet';return;}
+    for(const [label,n] of entries){
+      const row=document.createElement('div');row.className='bar-row';
+      const head=document.createElement('div');head.className='bar-label';
+      const name=document.createElement('span');name.textContent=label;const value=document.createElement('span');value.textContent=n;
+      head.append(name,value);const track=document.createElement('div');track.className='track';
+      const fill=document.createElement('div');fill.className='fill';fill.style.width=`${100*n/max}%`;
+      track.append(fill);row.append(head,track);target.append(row);
+    }
+  }
+  async function refresh(){
+    try{
+      const response=await fetch('/lab/report',{cache:'no-store'});if(!response.ok)throw Error(response.status);
+      const data=await response.json();$('events').textContent=data.total_events.toLocaleString();
+      $('sessions').textContent=data.virtual_sessions.toLocaleString();$('ips').textContent=Object.keys(data.by_observed_ip).length;
+      bars($('devices'),data.by_claimed_device);bars($('actions'),data.by_action);
+      $('rows').replaceChildren();for(const e of [...data.recent_events].reverse()){
+        const tr=document.createElement('tr');for(const value of [e.received_at,e.virtual_id,e.claimed_device,e.observed_ip,e.action,e.page]){
+          const td=document.createElement('td');td.textContent=String(value??'');tr.append(td);
+        }$('rows').append(tr);
+      }
+      $('status').textContent=`Last updated ${new Date().toLocaleTimeString()} · Local test data only`;
+    }catch(error){$('status').textContent=`Lab server unavailable: ${error.message}`;}
+  }
+  refresh();setInterval(refresh,2000);
+</script></body></html>
