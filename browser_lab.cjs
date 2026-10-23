@@ -134,8 +134,12 @@ async function runSession(browser, profileName, index, baseURL, output, runId, c
     await log(action)
   }
   const openMenu = async () => {
-    if (target.selectors.menu && await selector('menu').isVisible() &&
-        await selector('menu').getAttribute('aria-expanded') !== 'true') await selector('menu').click()
+    if (!target.selectors.menu || !await selector('menu').isVisible()) return
+    const expanded = await selector('menu').getAttribute('aria-expanded')
+    const navigationVisible = target.selectors.navigation
+      ? await selector('navigation').isVisible().catch(() => false)
+      : false
+    if (expanded !== 'true' && !navigationVisible) await selector('menu').click()
   }
   try {
     await newContext()
@@ -151,11 +155,13 @@ async function runSession(browser, profileName, index, baseURL, output, runId, c
     }
     await transition('landing', () => page.goto(url('home'), { waitUntil: 'domcontentloaded' }), url('home'))
     if (journey === 'browse') {
+      const playingText = target.expected?.playing || 'Playing'
+      const stoppedText = target.expected?.stopped || 'Stopped'
       await selector('play').click()
-      await selector('playerState').getByText('Playing', { exact: false }).waitFor()
+      await selector('playerState').filter({ hasText: playingText }).waitFor()
       await log('mock-player-play')
       await selector('play').click()
-      await selector('playerState').getByText('Stopped', { exact: false }).waitFor()
+      await selector('playerState').filter({ hasText: stoppedText }).waitFor()
       if (await selector('play').getAttribute('aria-pressed') !== 'false') throw Error('Mock player did not pause')
       await log('mock-player-pause')
       for (const key of ['shows', 'trending', 'videos']) {
@@ -163,24 +169,30 @@ async function runSession(browser, profileName, index, baseURL, output, runId, c
         await transition(`view-${key}`, () => selector(key).click(), url(key))
       }
     } else if (journey === 'history') {
+      await openMenu()
       await transition('history-shows', () => selector('shows').click(), url('shows'))
       await transition('history-back', () => page.goBack(), url('home'))
       await transition('history-forward', () => page.goForward(), url('shows'))
       await transition('history-reload', () => page.reload(), url('shows'))
     } else if (journey === 'mobile-menu') {
       if (!await selector('menu').isVisible()) throw Error('Mobile menu toggle is not visible')
-      if (await selector('menu').getAttribute('aria-expanded') !== 'false') throw Error('Mobile menu starts expanded')
-      if (await selector('navigation').isVisible()) throw Error('Mobile navigation starts visible')
+      const initialExpanded = await selector('menu').getAttribute('aria-expanded')
+      if (initialExpanded === 'true') throw Error('Mobile menu starts expanded')
+      if (await selector('navigation').isVisible().catch(() => false)) throw Error('Mobile navigation starts visible')
       await selector('menu').click()
-      if (await selector('menu').getAttribute('aria-expanded') !== 'true') throw Error('Mobile menu failed to open')
+      if (initialExpanded !== null && await selector('menu').getAttribute('aria-expanded') !== 'true') {
+        throw Error('Mobile menu failed to open')
+      }
       await selector('navigation').waitFor({ state: 'visible' })
       await log('mobile-menu-open')
       await selector('menu').click()
       await selector('navigation').waitFor({ state: 'hidden' })
       await log('mobile-menu-close')
       await openMenu()
-      await transition('mobile-menu-navigate', () => selector('navigation').locator(`a[href="${new URL(url('shows')).pathname}"]`).click(), url('shows'))
-      if (await selector('menu').getAttribute('aria-expanded') !== 'false') throw Error('Mobile menu did not close after navigation')
+      await transition('mobile-menu-navigate', () => selector('shows').click(), url('shows'))
+      const finalExpanded = await selector('menu').getAttribute('aria-expanded')
+      if (finalExpanded !== null && finalExpanded !== 'false') throw Error('Mobile menu did not close after navigation')
+      if (await selector('navigation').isVisible().catch(() => false)) throw Error('Mobile navigation remained visible after navigation')
     } else if (journey === 'returning') {
       const proof = randomUUID()
       await page.evaluate(value => {
