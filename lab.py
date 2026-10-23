@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+from pathlib import Path
 import threading
 from urllib.request import Request, urlopen
 
@@ -15,6 +16,7 @@ from urllib.request import Request, urlopen
 HOST = "127.0.0.1"
 DEVICE_TYPES = {"android", "ios", "desktop", "tablet"}
 MAX_EVENTS = 5000
+SITE_DIR = Path(__file__).resolve().parent / "site"
 
 
 class EventStore:
@@ -36,6 +38,8 @@ class EventStore:
             "total_events": len(events),
             "by_claimed_device": dict(Counter(e["claimed_device"] for e in events)),
             "by_observed_ip": dict(Counter(e["observed_ip"] for e in events)),
+            "by_action": dict(Counter(e["action"] for e in events)),
+            "virtual_sessions": len({e["virtual_id"] for e in events}),
             "recent_events": events[-10:],
         }
 
@@ -51,7 +55,23 @@ class LabHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_html(self, filename: str) -> None:
+        try:
+            body = (SITE_DIR / filename).read_bytes()
+        except FileNotFoundError:
+            return self.send_json(404, {"error": "Lab page not installed"})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
+        if self.path in {"/", "/shows", "/trending", "/videos"}:
+            return self.send_html("index.html")
+        if self.path == "/lab/dashboard":
+            return self.send_html("dashboard.html")
         if self.path == "/lab/report":
             return self.send_json(200, self.server.store.report())
         if self.path == "/lab/health":
@@ -81,6 +101,8 @@ class LabHandler(BaseHTTPRequestHandler):
             "claimed_device": device,
             "virtual_id": payload["virtual_id"][:64],
             "sequence": payload["sequence"],
+            "action": str(payload.get("action", "synthetic-request"))[:64],
+            "page": str(payload.get("page", "/lab/event"))[:100],
             "reported_user_agent": self.headers.get("User-Agent", "")[:160],
         }
         self.server.store.add(event)
