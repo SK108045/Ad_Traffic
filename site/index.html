@@ -14,6 +14,7 @@
     .brand span, .eyebrow, .accent { color: #ff6939; }
     nav { display: flex; flex-wrap: wrap; gap: clamp(.6rem, 3vw, 2rem); font-size: .8rem; text-transform: uppercase; font-weight: 750; }
     nav a:hover { color: #ff6939; }
+    #menu-toggle { display: none; }
     .lab-badge { display: inline-block; border: 1px solid #ffb165; color: #ffd9b2; border-radius: 30px; padding: .35rem .8rem; font-size: .65rem; font-weight: 900; letter-spacing: .09em; }
     main { max-width: 1180px; margin: auto; padding: 4rem 5vw 6rem; }
     .hero { padding: 3rem 0 4rem; display: grid; grid-template-columns: 1.4fr .8fr; align-items: center; gap: 3rem; }
@@ -34,13 +35,14 @@
     .card strong { font-size: 1.25rem; }
     .card span { color: #aaa; font-size: .8rem; }
     footer { color: #bdbdc1; padding: 2rem 5vw; font-size: .75rem; border-top: 1px solid #252528; }
-    @media(max-width:800px) { header { flex-wrap: wrap; } .hero { grid-template-columns: 1fr; } .record { max-width: 220px; margin: auto; } .cards { grid-template-columns: 1fr; } main { padding-top: 1.5rem; } }
+    @media(max-width:800px) { header { flex-wrap: wrap; } #menu-toggle { display: block; } #site-nav { display: none; order: 4; width: 100%; padding: 1rem 0; } #site-nav[data-open="true"] { display: flex; } .hero { grid-template-columns: 1fr; } .record { max-width: 220px; margin: auto; } .cards { grid-template-columns: 1fr; } main { padding-top: 1.5rem; } }
   </style>
 </head>
 <body>
   <header>
     <a href="/" class="brand">RIENG<span>FLIX</span></a>
-    <nav aria-label="Lab site sections"><a href="/">Home</a><a href="/shows">Shows</a><a href="/trending">Trending</a><a href="/videos">Videos</a></nav>
+    <button id="menu-toggle" type="button" aria-controls="site-nav" aria-expanded="false">Menu</button>
+    <nav id="site-nav" aria-label="Lab site sections"><a href="/">Home</a><a href="/shows">Shows</a><a href="/trending">Trending</a><a href="/videos">Videos</a></nav>
     <span class="lab-badge">SYNTHETIC / NO ADS</span>
   </header>
   <main>
@@ -66,6 +68,15 @@
   </main>
   <footer>RIENG synthetic staging experience · Not the live site · Not connected to any advertiser</footer>
   <script>
+    const menu = document.getElementById('menu-toggle');
+    const navigation = document.getElementById('site-nav');
+    function closeMenu() { menu.setAttribute('aria-expanded', 'false'); navigation.dataset.open = 'false'; }
+    menu.addEventListener('click', () => {
+      const open = menu.getAttribute('aria-expanded') !== 'true';
+      menu.setAttribute('aria-expanded', String(open)); navigation.dataset.open = String(open);
+    });
+    navigation.addEventListener('click', event => { if (event.target.closest('a')) closeMenu(); });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') { closeMenu(); menu.focus(); } });
     const titles = { '/shows': 'Daily <span class="accent">shows</span>', '/trending': 'Trending <span class="accent">now</span>', '/videos': 'RIENG <span class="accent">TV</span>' };
     if (titles[location.pathname]) document.getElementById('route-title').innerHTML = titles[location.pathname];
     const button = document.getElementById('tune-in');

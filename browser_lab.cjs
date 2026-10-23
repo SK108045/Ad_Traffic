@@ -1,139 +1,212 @@
 #!/usr/bin/env node
-/* Actual browser QA against the bundled local, advertising-free staging site. */
 'use strict'
-
 const fs = require('node:fs/promises')
 const path = require('node:path')
 const { randomUUID } = require('node:crypto')
-const { chromium, devices } = require('playwright')
+const { performance } = require('node:perf_hooks')
+const { chromium, firefox, webkit } = require('playwright')
+const { profiles, options, resolveTarget } = require('./lib/config.cjs')
+const { createContext } = require('./lib/network.cjs')
+const { attachMetrics } = require('./lib/metrics.cjs')
 
-const HOST = '127.0.0.1'
-const profiles = {
-  desktop: { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, isMobile: false, hasTouch: false },
-  android: { ...devices['Pixel 7'] },
-  iphone: { ...devices['iPhone 13'] },
-  tablet: { ...devices['iPad Mini'] },
-}
-
-function options(argv) {
-  const config = { profiles: Object.keys(profiles), port: 8765, headed: false, browser: 'auto' }
-  for (let i = 0; i < argv.length; i++) {
-    const flag = argv[i]
-    if (flag === '--headed') config.headed = true
-    else if (flag === '--help' || flag === '-h') config.help = true
-    else if (['--profiles', '--port', '--browser', '--output'].includes(flag)) {
-      const value = argv[++i]
-      if (!value || value.startsWith('--')) throw Error(`Missing value for ${flag}`)
-      if (flag === '--profiles') config.profiles = value.split(',').map(s => s.trim().toLowerCase())
-      if (flag === '--port') config.port = Number(value)
-      if (flag === '--browser') config.browser = value.toLowerCase()
-      if (flag === '--output') config.outputRoot = path.resolve(value)
-    } else throw Error(`Unknown option: ${flag}. Use --help for usage.`)
-  }
-  if (config.profiles.length < 1 || config.profiles.length > 8 ||
-      config.profiles.some(p => !Object.hasOwn(profiles, p))) {
-    throw Error('Choose 1-8 profiles: desktop, android, iphone, tablet (repeats allowed)')
-  }
-  if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) {
-    throw Error('Port must be 1-65535')
-  }
-  if (!['auto', 'chrome', 'msedge', 'chromium'].includes(config.browser)) {
-    throw Error('Browser must be auto, chrome, msedge, or chromium')
-  }
-  return config
-}
-
-async function launchBrowser(config) {
-  // Reuse installed browsers through supported channels, without copying binaries.
-  const candidates = config.browser === 'auto' ? ['chrome', 'msedge', 'chromium'] : [config.browser]
+async function launchBrowser(config, profileName = 'desktop') {
+  const requested = ['iphone', 'tablet'].includes(profileName) ? 'webkit' : config.browser
+  const candidates = requested === 'auto' ? ['chrome', 'msedge', 'chromium'] : [requested]
   const errors = []
   for (const name of candidates) {
     try {
-      const browser = await chromium.launch({
-        headless: !config.headed,
-        ...(name === 'chromium' ? {} : { channel: name }),
-        timeout: 60000,
-      })
+      const type = name === 'firefox' ? firefox : name === 'webkit' ? webkit : chromium
+      const browser = await type.launch({ headless: !config.headed,
+        ...(['chrome', 'msedge'].includes(name) ? { channel: name } : {}), timeout: 60000 })
       return { browser, name }
-    } catch (error) {
-      errors.push(`${name}: ${error.message.split('\n')[0]}`)
+    } catch (error) { errors.push(`${name}: ${error.message.split('\n')[0]}`) }
+  }
+  throw Error(`Cannot launch ${requested}: ${errors.join('; ')}. Run: npx playwright install chromium firefox webkit`)
+}
+
+async function fetchJSON(url, payload, userAgent) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(10000), ...(payload ? {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': userAgent },
+    body: JSON.stringify(payload),
+  } : {}) })
+  if (!response.ok) throw Error(`${url}: HTTP ${response.status}`)
+  return response.json()
+}
+
+async function finishContext(context, tracing, mode, result, filename) {
+  let saved = false
+  try {
+    if (tracing) {
+      // Write before cleanup so a cleanup failure also retains a usable trace.
+      await context.tracing.stop({ path: filename })
+      saved = true
+    }
+  } catch (error) {
+    result.status = 'failed'
+    result.trace_error = error.message
+    result.error = [result.error, `Trace capture failed: ${error.message}`].filter(Boolean).join('\n')
+  }
+  try { await context.close() }
+  catch (error) {
+    result.status = 'failed'
+    result.error = [result.error, `Context cleanup failed: ${error.message}`].filter(Boolean).join('\n')
+  }
+  if (saved) {
+    if (mode === 'on' || result.status === 'failed') {
+      result.trace ||= filename
+      ;(result.traces ||= []).push(filename)
+    } else {
+      try { await fs.unlink(filename) }
+      catch (error) {
+        result.status = 'failed'
+        result.trace = filename
+        result.traces = [filename]
+        result.trace_error = `Cannot discard successful trace: ${error.message}`
+        result.error = [result.error, result.trace_error].filter(Boolean).join('\n')
+      }
     }
   }
-  throw Error(`Cannot launch a browser. ${errors.join('; ')}. ` +
-    'Install Chrome/Edge, or run: npx playwright install chromium')
 }
 
-async function createContext(browser, profileName, baseUrl) {
-  const context = await browser.newContext({ ...profiles[profileName], serviceWorkers: 'block' })
-  const origin = new URL(baseUrl).origin
-  await context.route('**/*', route => {
-    try {
-      if (new URL(route.request().url()).origin === origin) return route.continue()
-    } catch { /* Reject malformed URLs. */ }
-    return route.abort('blockedbyclient')
-  })
-  await context.routeWebSocket('**/*', socket => socket.close())
-  context.setDefaultTimeout(30000)
-  context.setDefaultNavigationTimeout(60000)
-  return context
-}
-
-async function record(page, payload) {
-  await page.evaluate(async event => {
-    const response = await fetch('/lab/event', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(event),
-    })
-    if (!response.ok) throw Error(`Synthetic lab event failed: ${response.status}`)
-  }, payload)
-}
-
-async function runSession(browser, profileName, index, baseUrl, output, runId) {
+async function runSession(browser, profileName, index, baseURL, output, runId, config = {}) {
+  const target = config.target || resolveTarget({ port: 8765, targetURL: baseURL })
+  if (!config.target) {
+    Object.assign(target, require('./lib/config.cjs').bundled, { baseURL })
+    target.routes = { ...target.routes, home: baseURL }
+  }
+  const journey = config.journey || 'browse'
   const virtualId = `browser-${runId}-${index}-${profileName}`
-  const result = { virtualId, profile: profileName, status: 'passed', actions: [], consoleErrors: [] }
-  let context, page
+  const result = { virtualId, profile: profileName, journey, status: 'passed', actions: [],
+    consoleErrors: [], engine: browser.browserType().name(), browser_version: browser.version(),
+    documents: [], transitions: [] }
+  if (journey === 'mobile-menu' && profileName === 'desktop') {
+    return { ...result, status: 'skipped', reason: 'Mobile-menu journey requires a mobile/tablet profile' }
+  }
+  const traceMode = config.trace || 'retain-on-failure'
+  const contexts = []
+  let page, context, snapshot, userAgent = 'SyntheticBrowserLab/2.0'
+  const receiver = config.receiverURL || new URL(baseURL).origin
+  const url = key => new URL(target.routes[key], target.baseURL).href
+  const selector = key => page.locator(target.selectors[key])
   const log = async action => {
-    const pathname = new URL(page.url()).pathname
-    await record(page, {
-      claimed_device: profileName === 'iphone' ? 'ios' : profileName,
-      virtual_id: virtualId, sequence: result.actions.length + 1, action, page: pathname,
-    })
+    const pathname = /^https?:/.test(page.url()) ? new URL(page.url()).pathname.slice(0, 100) : '/'
+    await fetchJSON(`${receiver}/lab/event`, { claimed_device: profileName === 'iphone' ? 'ios' : profileName,
+      virtual_id: virtualId, sequence: result.actions.length + 1, action, page: pathname }, userAgent)
     result.actions.push({ action, path: pathname })
   }
-  try {
-    context = await createContext(browser, profileName, baseUrl)
-    page = await context.newPage()
-    page.on('pageerror', error => result.consoleErrors.push(error.message))
-    await page.goto(baseUrl, { waitUntil: 'domcontentloaded' })
-    await page.getByText('SYNTHETIC / NO ADS').waitFor()
-    await log('landing')
-    await page.locator('#tune-in').click()
-    await page.locator('#player-state').getByText('Playing', { exact: false }).waitFor()
-    await log('mock-player-play')
-    await page.locator('#tune-in').click()
-    await page.locator('#player-state').getByText('Stopped', { exact: false }).waitFor()
-    if (await page.locator('#tune-in').getAttribute('aria-pressed') !== 'false') {
-      throw Error('Mock player did not pause')
+  const newContext = async storageState => {
+    context = await createContext(browser, profileName, target.baseURL, { ...config,
+      ...(storageState && config.network === 'offline' ? { network: 'native' } : {}),
+      allowedOrigins: target.allowedOrigins, storageState })
+    const entry = { context, tracing: false }
+    contexts.push(entry)
+    if (traceMode !== 'off') {
+      await context.tracing.start({ screenshots: true, snapshots: true, sources: false })
+      entry.tracing = true
     }
-    await log('mock-player-pause')
-    await page.locator('#schedule-link').click()
-    await page.waitForURL('**/shows')
-    await page.getByRole('heading', { name: 'Daily shows', exact: true }).waitFor()
-    await log('view-shows')
-    await page.locator('nav a[href="/trending"]').click()
-    await page.waitForURL('**/trending')
-    await page.getByRole('heading', { name: 'Trending now', exact: true }).waitFor()
-    await log('view-trending')
-    await page.locator('nav a[href="/videos"]').click()
-    await page.waitForURL('**/videos')
-    await page.getByRole('heading', { name: 'RIENG TV', exact: true }).waitFor()
-    await log('view-videos')
-    const layout = await page.evaluate(() => ({
-      viewport: { width: innerWidth, height: innerHeight },
+    snapshot = await attachMetrics(context, result)
+    page = await context.newPage()
+    if (context.labConfigurePage) await context.labConfigurePage(page)
+    page.on('pageerror', error => result.consoleErrors.push(error.message))
+    page.on('response', response => {
+      if (response.request().isNavigationRequest() && response.frame() === page.mainFrame() && response.status() >= 400) {
+        result.navigation_error = `Navigation returned HTTP ${response.status()}: ${response.url()}`
+      }
+    })
+    result.network ||= context.labNetwork
+  }
+  const ready = async () => {
+    await page.waitForLoadState('load')
+    if (result.navigation_error) throw Error(result.navigation_error)
+    if (target.selectors.ready) await selector('ready').waitFor({ state: 'visible' })
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    userAgent = await page.evaluate(() => navigator.userAgent)
+    await snapshot(page)
+  }
+  const transition = async (action, operation, expectedURL) => {
+    await snapshot(page)
+    const from = page.url(), start = performance.now()
+    const response = await operation()
+    if (response && typeof response.status === 'function' && response.status() >= 400) throw Error(`Navigation returned HTTP ${response.status()}`)
+    if (expectedURL) await page.waitForURL(expectedURL)
+    await ready()
+    result.transitions.push({ action, from, to: page.url(), duration_ms: performance.now() - start })
+    await log(action)
+  }
+  const openMenu = async () => {
+    if (target.selectors.menu && await selector('menu').isVisible() &&
+        await selector('menu').getAttribute('aria-expanded') !== 'true') await selector('menu').click()
+  }
+  try {
+    await newContext()
+    if (config.network === 'offline') {
+      let blocked = false
+      try { await page.goto(url('home'), { waitUntil: 'domcontentloaded' }) } catch { blocked = true }
+      if (!blocked) throw Error('Offline profile unexpectedly allowed navigation')
+      result.offline_verified = true
+      await log('offline-blocked')
+      await context.setOffline(false)
+      // Settle the browser's error document before measuring the recovery navigation.
+      await page.goto('about:blank')
+    }
+    await transition('landing', () => page.goto(url('home'), { waitUntil: 'domcontentloaded' }), url('home'))
+    if (journey === 'browse') {
+      await selector('play').click()
+      await selector('playerState').getByText('Playing', { exact: false }).waitFor()
+      await log('mock-player-play')
+      await selector('play').click()
+      await selector('playerState').getByText('Stopped', { exact: false }).waitFor()
+      if (await selector('play').getAttribute('aria-pressed') !== 'false') throw Error('Mock player did not pause')
+      await log('mock-player-pause')
+      for (const key of ['shows', 'trending', 'videos']) {
+        await openMenu()
+        await transition(`view-${key}`, () => selector(key).click(), url(key))
+      }
+    } else if (journey === 'history') {
+      await transition('history-shows', () => selector('shows').click(), url('shows'))
+      await transition('history-back', () => page.goBack(), url('home'))
+      await transition('history-forward', () => page.goForward(), url('shows'))
+      await transition('history-reload', () => page.reload(), url('shows'))
+    } else if (journey === 'mobile-menu') {
+      if (!await selector('menu').isVisible()) throw Error('Mobile menu toggle is not visible')
+      if (await selector('menu').getAttribute('aria-expanded') !== 'false') throw Error('Mobile menu starts expanded')
+      if (await selector('navigation').isVisible()) throw Error('Mobile navigation starts visible')
+      await selector('menu').click()
+      if (await selector('menu').getAttribute('aria-expanded') !== 'true') throw Error('Mobile menu failed to open')
+      await selector('navigation').waitFor({ state: 'visible' })
+      await log('mobile-menu-open')
+      await selector('menu').click()
+      await selector('navigation').waitFor({ state: 'hidden' })
+      await log('mobile-menu-close')
+      await openMenu()
+      await transition('mobile-menu-navigate', () => selector('navigation').locator(`a[href="${new URL(url('shows')).pathname}"]`).click(), url('shows'))
+      if (await selector('menu').getAttribute('aria-expanded') !== 'false') throw Error('Mobile menu did not close after navigation')
+    } else if (journey === 'returning') {
+      const proof = randomUUID()
+      await page.evaluate(value => {
+        localStorage.setItem('lab-return-proof', value)
+        sessionStorage.setItem('lab-return-proof', value)
+        document.cookie = `lab-return-proof=${value}; path=/; SameSite=Lax`
+      }, proof)
+      const state = await context.storageState()
+      await log('first-visit-saved')
+      await snapshot(page)
+      await page.close()
+      await newContext(state)
+      await transition('return-visit', () => page.goto(url('home')), url('home'))
+      const restored = await page.evaluate(() => ({ local: localStorage.getItem('lab-return-proof'),
+        session: sessionStorage.getItem('lab-return-proof'), cookie: document.cookie }))
+      if (restored.local !== proof || !restored.cookie.split('; ').includes(`lab-return-proof=${proof}`) || restored.session !== null) {
+        throw Error('Returning context did not restore cookies/local storage with fresh session storage')
+      }
+      result.returning_session = { cookies_restored: true, local_storage_restored: true, session_storage_fresh: true }
+      await log('returning-session-verified')
+    }
+    const layout = await page.evaluate(() => ({ viewport: { width: innerWidth, height: innerHeight },
       width: document.documentElement.scrollWidth,
-      touch: navigator.maxTouchPoints > 0,
-      userAgent: navigator.userAgent,
-      deviceScaleFactor: devicePixelRatio,
-    }))
+      touch: navigator.maxTouchPoints > 0 || matchMedia('(any-pointer: coarse)').matches,
+      maxTouchPoints: navigator.maxTouchPoints, coarsePointer: matchMedia('(any-pointer: coarse)').matches,
+      userAgent: navigator.userAgent, deviceScaleFactor: devicePixelRatio }))
     if (layout.width > layout.viewport.width + 1) throw Error('Page overflows the device viewport')
     result.device = layout
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
@@ -141,78 +214,130 @@ async function runSession(browser, profileName, index, baseUrl, output, runId) {
     result.screenshot = path.join(output, `${virtualId}.png`)
     await page.screenshot({ path: result.screenshot, fullPage: true })
     await log('screenshot')
+    await snapshot(page)
+    // Finalize page-lifetime Web Vitals before disposing the context.
+    await page.goto('about:blank')
     if (result.consoleErrors.length) throw Error(`Page JavaScript errors: ${result.consoleErrors.join('; ')}`)
   } catch (error) {
     result.status = 'failed'
     result.error = error.message
     if (page && !page.isClosed()) {
-      const screenshot = path.join(output, `${virtualId}-failed.png`)
       try {
-        await page.screenshot({ path: screenshot, fullPage: true, timeout: 10000 })
-        result.screenshot = screenshot
-      } catch { /* A closed/crashed page may not allow a screenshot. */ }
+        if (snapshot) await snapshot(page)
+        result.screenshot = path.join(output, `${virtualId}-failed.png`)
+        await page.screenshot({ path: result.screenshot, fullPage: true, timeout: 10000 })
+      } catch { /* A closed/crashed page may not allow diagnostics. */ }
     }
   } finally {
-    if (context) await context.close()
+    for (let i = contexts.length - 1; i >= 0; i--) {
+      const entry = contexts[i]
+      await finishContext(entry.context, entry.tracing, traceMode === 'retain-on-failure' ? 'on' : traceMode, result,
+        path.join(output, `${virtualId}${i ? '-return' : ''}-trace.zip`))
+    }
+    if (traceMode === 'retain-on-failure' && result.status === 'passed' && result.traces) {
+      for (const filename of result.traces) {
+        try { await fs.unlink(filename) }
+        catch (error) {
+          result.status = 'failed'
+          result.trace = filename
+          result.trace_error = `Cannot discard successful trace: ${error.message}`
+          result.error = [result.error, result.trace_error].filter(Boolean).join('\n')
+        }
+      }
+      if (result.status === 'passed') { delete result.trace; delete result.traces }
+    }
   }
   return result
 }
 
-async function fetchJSON(url) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(5000) })
-  if (!response.ok) throw Error(`${url}: HTTP ${response.status}`)
-  return response.json()
+async function runDashboard(browser, receiver, output, mode, timeout) {
+  const context = await createContext(browser, 'desktop', receiver, { timeout })
+  const result = { status: 'passed' }
+  let tracing = false
+  try {
+    if (mode !== 'off') { await context.tracing.start({ screenshots: true, snapshots: true }); tracing = true }
+    const page = await context.newPage(), errors = []
+    page.on('pageerror', error => errors.push(error.message))
+    await page.goto(`${receiver}/lab/dashboard`)
+    await page.waitForFunction(() => document.querySelector('#status').textContent.startsWith('Last updated'))
+    if (errors.length) throw Error(`Dashboard JavaScript errors: ${errors.join('; ')}`)
+    result.screenshot = path.join(output, 'dashboard.png')
+    await page.screenshot({ path: result.screenshot, fullPage: true })
+  } catch (error) { result.status = 'failed'; result.error = error.message }
+  finally { await finishContext(context, tracing, mode, result, path.join(output, 'dashboard-trace.zip')) }
+  return result
 }
 
 async function runLab(config) {
-  const baseUrl = `http://${HOST}:${config.port}`
+  const receiver = `http://127.0.0.1:${config.port}`
   let health
-  try { health = await fetchJSON(`${baseUrl}/lab/health`) }
-  catch (error) { throw Error(`Local receiver unavailable at ${baseUrl}. Run npm start. ${error.message}`) }
+  try { health = await fetchJSON(`${receiver}/lab/health`) }
+  catch (error) { throw Error(`Local receiver unavailable at ${receiver}. Run npm start. ${error.message}`) }
   if (health.ok !== true || health.synthetic_only !== true) throw Error('Expected the local synthetic lab receiver')
+  const target = config.target || resolveTarget(config)
   const outputRoot = config.outputRoot || path.join(__dirname, 'artifacts')
   await fs.mkdir(outputRoot, { recursive: true })
   const output = await fs.mkdtemp(path.join(outputRoot, new Date().toISOString().replace(/[:.]/g, '-') + '-'))
-  const summary = { synthetic_only: true, runId: randomUUID().slice(0, 12),
-    started_at: new Date().toISOString(), status: 'passed', sessions: [], output }
-  let browser
+  const summary = { synthetic_only: true, runId: randomUUID().slice(0, 12), trace_mode: config.trace,
+    target, started_at: new Date().toISOString(), status: 'passed', sessions: [], browsers: {}, output }
+  const launched = new Map()
   try {
-    const launched = await launchBrowser(config)
-    browser = launched.browser
-    summary.browser = launched.name
-    summary.browser_version = browser.version()
-    const settled = await Promise.allSettled(config.profiles.map((profile, index) =>
-      runSession(browser, profile, index + 1, baseUrl, output, summary.runId)))
-    summary.sessions = settled.map((result, index) => result.status === 'fulfilled' ? result.value :
-      { profile: config.profiles[index], status: 'failed', error: result.reason.message, actions: [] })
-    if (summary.sessions.some(session => session.status !== 'passed')) summary.status = 'failed'
-    summary.report = await fetchJSON(`${baseUrl}/lab/report`)
-    // The dashboard is also exercised in a real browser and saved for review.
-    const context = await createContext(browser, 'desktop', baseUrl)
-    try {
-      const dashboard = await context.newPage()
-      const errors = []
-      dashboard.on('pageerror', error => errors.push(error.message))
-      await dashboard.goto(`${baseUrl}/lab/dashboard`, { waitUntil: 'domcontentloaded' })
-      await dashboard.waitForFunction(() => document.querySelector('#status').textContent.startsWith('Last updated'))
-      if (errors.length) throw Error(`Dashboard JavaScript errors: ${errors.join('; ')}`)
-      summary.dashboard_screenshot = path.join(output, 'dashboard.png')
-      await dashboard.screenshot({ path: summary.dashboard_screenshot, fullPage: true })
-    } finally { await context.close() }
-  } catch (error) {
-    summary.status = 'failed'
-    summary.error = error.message
-  } finally {
-    if (browser) await browser.close()
+    const jobs = []
+    for (const profile of config.profiles) {
+      const key = ['iphone', 'tablet'].includes(profile) ? 'webkit' : config.browser
+      if (!launched.has(key)) {
+        try {
+          const value = await launchBrowser(config, profile)
+          launched.set(key, value)
+          summary.browsers[value.name] = value.browser.version()
+        } catch (error) { launched.set(key, { error: error.message }) }
+      }
+      for (const journey of config.journeys) for (const network of config.networks) jobs.push({ profile, journey, network, key })
+    }
+    summary.browser = Object.keys(summary.browsers).join(', ')
+    summary.sessions = new Array(jobs.length)
+    let next = 0
+    const worker = async () => {
+      while (next < jobs.length) {
+        const index = next++, job = jobs[index], value = launched.get(job.key)
+        if (value.error) {
+          summary.sessions[index] = { ...job, status: 'failed', actions: [], error: value.error }
+          continue
+        }
+        try {
+          summary.sessions[index] = await runSession(value.browser, job.profile, index + 1, target.baseURL,
+            output, summary.runId, { ...config, ...job, target, receiverURL: receiver })
+        } catch (error) { summary.sessions[index] = { ...job, status: 'failed', actions: [], error: error.message } }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(config.concurrency || 4, jobs.length) }, worker))
+    if (summary.sessions.some(s => s.status === 'failed')) summary.status = 'failed'
+    summary.report = await fetchJSON(`${receiver}/lab/report`)
+    const available = [...launched.values()].find(item => item.browser)
+    if (available) {
+      const dashboard = await runDashboard(available.browser, receiver, output, summary.trace_mode, config.timeout)
+      summary.dashboard_screenshot = dashboard.screenshot
+      if (dashboard.trace) summary.dashboard_trace = dashboard.trace
+      if (dashboard.trace_error) summary.dashboard_trace_error = dashboard.trace_error
+      if (dashboard.status === 'failed') { summary.status = 'failed'; summary.error = dashboard.error }
+    }
+  } catch (error) { summary.status = 'failed'; summary.error = error.message }
+  finally {
+    for (const value of launched.values()) if (value.browser) {
+      try { await value.browser.close() }
+      catch (error) { summary.status = 'failed'; summary.cleanup_error = error.message }
+    }
     summary.finished_at = new Date().toISOString()
     await fs.writeFile(path.join(output, 'summary.json'), JSON.stringify(summary, null, 2) + '\n')
   }
-  console.log(`${summary.status === 'passed' ? 'Finished' : 'Failed'} ${summary.sessions.length} virtual browser sessions (${summary.browser || config.browser}).`)
-  console.log(`Screenshots + JSON report: ${output}`)
-  console.log(`Dashboard: ${baseUrl}/lab/dashboard`)
+  console.log(`${summary.status === 'passed' ? 'Finished' : 'Failed'} ${summary.sessions.length} browser journeys (${summary.browser}).`)
+  console.log(`Screenshots, metrics and JSON report: ${output}`)
+  console.log(`Dashboard: ${receiver}/lab/dashboard`)
   if (summary.status !== 'passed') {
-    const failures = summary.sessions.filter(s => s.status === 'failed').map(s => `${s.profile}: ${s.error}`)
-    throw Error([summary.error, ...failures].filter(Boolean).join('\n'))
+    const error = Error([summary.error, ...summary.sessions.filter(s => s.status === 'failed').map(s =>
+      `${s.profile}/${s.journey}/${typeof s.network === 'string' ? s.network : s.network?.name}: ${s.error}`)].filter(Boolean).join('\n'))
+    error.summary = summary
+    throw error
   }
   return summary
 }
@@ -220,16 +345,20 @@ async function runLab(config) {
 async function main() {
   const config = options(process.argv.slice(2))
   if (config.help) {
-    console.log('Usage: node browser_lab.cjs [--profiles desktop,android,iphone,tablet] [--port 8765]\n' +
-      '  [--browser auto|chrome|msedge|chromium] [--headed] [--output artifacts]\n' +
-      'Auto reuses installed Chrome, then Edge, then downloaded Playwright Chromium. Up to 8 profiles, repeats allowed.')
+    console.log('Usage: node browser_lab.cjs [options]\n' +
+      '  --profiles desktop,android,iphone,tablet (1-8; repeats allowed)\n' +
+      '  --browser auto|chrome|msedge|chromium|firefox|webkit [--headed]\n' +
+      '  Auto: Chrome/Edge/Chromium for desktop/Android; WebKit for iPhone/iPad.\n' +
+      '  --target URL | --config target.json (custom targets default to smoke)\n' +
+      '  --journeys browse,history,mobile-menu,returning,smoke\n' +
+      '  --networks native,fast-4g,slow-3g,offline\n' +
+      '  --trace retain-on-failure|on|off (default: retain-on-failure)\n' +
+      '  --port 8765 --output artifacts --timeout 30000 --concurrency 4\n' +
+      '  Maximum 64 matrix sessions; desktop mobile-menu is explicitly skipped.')
     return
   }
   await runLab(config)
 }
 
-module.exports = { profiles, options, launchBrowser, createContext, runSession, runLab }
-if (require.main === module) main().catch(error => {
-  console.error(`Browser lab failed: ${error.message}`)
-  process.exitCode = 1
-})
+module.exports = { profiles, options, launchBrowser, createContext, runSession, runLab, finishContext }
+if (require.main === module) main().catch(error => { console.error(`Browser lab failed: ${error.message}`); process.exitCode = 1 })

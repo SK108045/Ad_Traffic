@@ -17,11 +17,12 @@ try {
     if ($DownloadChromium) {
         Invoke-Checked -Executable 'npx.cmd' -Arguments @('playwright', 'install', 'chromium')
     }
-    & node scripts/check-browser.cjs
+    Invoke-Checked -Executable 'npx.cmd' -Arguments @('playwright', 'install', 'firefox', 'webkit')
+    & node scripts/check-browser.cjs --chromium-only
     if ($LASTEXITCODE -ne 0) {
         Invoke-Checked -Executable 'npx.cmd' -Arguments @('playwright', 'install', 'chromium')
-        Invoke-Checked -Executable 'node' -Arguments @('scripts/check-browser.cjs')
     }
+    Invoke-Checked -Executable 'node' -Arguments @('scripts/check-browser.cjs')
     Write-Host 'Setup complete. Start the receiver: npm.cmd start'
 }
 finally { Pop-Location }

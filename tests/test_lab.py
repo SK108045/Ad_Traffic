@@ -130,9 +130,14 @@ class ReceiverTests(unittest.TestCase):
             folder = artifacts / "test-run"
             folder.mkdir(parents=True)
             (folder / "screen.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (folder / "session-trace.zip").write_bytes(b"PK\x03\x04trace-test")
+            (folder / "return-trace.zip").write_bytes(b"PK\x03\x04return-test")
+            (folder / "dashboard-trace.zip").write_bytes(b"PK\x03\x04dashboard-test")
             (folder / "summary.json").write_text(json.dumps({"browser": "chrome", "sessions": [
-                {"profile": "desktop", "screenshot": str(folder / "screen.png")}
-            ]}))
+                {"profile": "desktop", "journey": "returning", "screenshot": str(folder / "screen.png"),
+                 "traces": [str(folder / "session-trace.zip"), str(folder / "return-trace.zip"),
+                            str(folder / "missing-trace.zip")]}
+            ], "dashboard_trace": str(folder / "dashboard-trace.zip")}))
             (Path(temp) / "secret.json").write_text('{"secret":true}')
             broken = artifacts / "broken-run"
             broken.mkdir()
@@ -145,7 +150,16 @@ class ReceiverTests(unittest.TestCase):
                 self.assertEqual(runs[0]["session_count"], 1)
                 with local_open(base + runs[0]["screenshots"][0]["url"]) as response:
                     self.assertEqual(response.headers["Content-Type"], "image/png")
+                self.assertEqual(len(runs[0]["traces"]), 3)
+                self.assertEqual(runs[0]["sessions"][0]["journey"], "returning")
+                for trace in runs[0]["traces"]:
+                    with local_open(base + trace["url"]) as response:
+                        self.assertEqual(response.headers["Content-Type"], "application/zip")
+                        self.assertIn("attachment; filename=", response.headers["Content-Disposition"])
+                        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+                        self.assertTrue(response.read().startswith(b"PK"))
                 for route in ("/lab/artifacts/%2e%2e/secret.json", "/lab/artifacts/../secret.json",
+                              "/lab/artifacts/%2e%2e/secret.zip", "/lab/artifacts/missing.zip",
                               "/lab/artifacts/missing.png", "/lab/artifacts/test-run/file.py"):
                     with self.assertRaises(HTTPError) as caught:
                         local_open(base + route)

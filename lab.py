@@ -13,7 +13,7 @@ from pathlib import Path
 import sys
 import threading
 from urllib.error import URLError
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 from uuid import uuid4
 import warnings
@@ -137,10 +137,11 @@ class LabHandler(BaseHTTPRequestHandler):
         if route.startswith("/lab/artifacts/"):
             target = (self.server.artifacts_dir / unquote(route[len("/lab/artifacts/"):])).resolve()
             if (not target.is_relative_to(self.server.artifacts_dir) or
-                    target.suffix not in {".png", ".json"} or not target.is_file()):
+                    target.suffix not in {".png", ".json", ".zip"} or not target.is_file()):
                 return self.send_json(404, {"error": "Artifact not found"})
-            content_type = "image/png" if target.suffix == ".png" else "application/json"
-            return self.send_body(200, target.read_bytes(), content_type)
+            content_type = {".png": "image/png", ".json": "application/json", ".zip": "application/zip"}[target.suffix]
+            return self.send_body(200, target.read_bytes(), content_type,
+                                  target.name if target.suffix == ".zip" else None)
         if route == "/favicon.ico":
             return self.send_body(204, b"", "image/x-icon")
         self.send_json(404, {"error": "Not found"})
@@ -192,24 +193,48 @@ class LabServer(ThreadingHTTPServer):
                 continue
             try:
                 summary = json.loads((folder / "summary.json").read_text(encoding="utf-8"))
+                if not isinstance(summary, dict):
+                    continue
                 sessions = summary["sessions"]
                 if not isinstance(sessions, list) or any(not isinstance(s, dict) for s in sessions):
                     continue
+                def artifact_link(filename: object, label: str) -> dict | None:
+                    if not isinstance(filename, str):
+                        return None
+                    name = Path(filename).name
+                    candidate = (folder / name).resolve()
+                    if (not candidate.is_relative_to(folder.resolve()) or not candidate.is_file()
+                            or candidate.suffix not in {".png", ".json", ".zip"}):
+                        return None
+                    return {"label": label, "url": f"/lab/artifacts/{quote(folder.name)}/{quote(name)}"}
+
+                traces, screenshots = [], []
+                for index, session in enumerate(sessions):
+                    label = f"{session.get('profile', 'unknown')} {index + 1} / {session.get('journey', 'browse')}"
+                    for number, filename in enumerate(session.get("traces") or [session.get("trace")]):
+                        link = artifact_link(filename, f"Trace: {label} ({number + 1})")
+                        if link:
+                            traces.append(link)
+                    link = artifact_link(session.get("screenshot"), label)
+                    if link:
+                        screenshots.append(link)
+                for key, items, label in (("dashboard_trace", traces, "Dashboard trace"),
+                                          ("dashboard_screenshot", screenshots, "Dashboard")):
+                    link = artifact_link(summary.get(key), label)
+                    if link:
+                        items.append(link)
                 runs.append({
                     "id": folder.name,
                     "status": summary.get("status", "passed"),
                     "browser": summary.get("browser", "chromium"),
                     "session_count": len(sessions),
-                    "summary_url": f"/lab/artifacts/{folder.name}/summary.json",
-                    "screenshots": [
-                        {"profile": session["profile"], "label": f"{session['profile']} {index + 1}",
-                         "url": f"/lab/artifacts/{folder.name}/{Path(session['screenshot']).name}"}
-                        for index, session in enumerate(sessions) if session.get("screenshot")
-                    ] + ([{"profile": "Dashboard", "url":
-                          f"/lab/artifacts/{folder.name}/{Path(summary['dashboard_screenshot']).name}"}]
-                         if summary.get("dashboard_screenshot") else []),
+                    "summary_url": f"/lab/artifacts/{quote(folder.name)}/summary.json",
+                    "target": (summary.get("target") or {}).get("name", "Bundled staging site"),
+                    "sessions": sessions,
+                    "traces": traces,
+                    "screenshots": screenshots,
                 })
-            except (OSError, ValueError, TypeError, KeyError):
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
                 continue
             if len(runs) == 20:
                 break
@@ -249,6 +274,8 @@ def main() -> None:
     server_parser.add_argument("--port", type=int, default=8765)
     server_parser.add_argument("--event-log", type=Path, default=ARTIFACTS_DIR / "events.jsonl")
     server_parser.add_argument("--no-persist", action="store_true", help="Keep events in memory only")
+    server_parser.add_argument("--artifacts-dir", type=Path, default=ARTIFACTS_DIR,
+                               help="Directory served by the dashboard artifact viewer")
     simulator = commands.add_parser("simulate", help="Generate synthetic device events")
     simulator.add_argument("--devices", default="android,ios,desktop")
     simulator.add_argument("--count", type=int, default=5, help="Events per virtual device (1-100)")
@@ -262,7 +289,7 @@ def main() -> None:
         parser.error("Port must be 1-65535 (serve also accepts 0 for an available port)")
     try:
         if args.command == "serve":
-            with LabServer(args.port, None if args.no_persist else args.event_log) as server:
+            with LabServer(args.port, None if args.no_persist else args.event_log, args.artifacts_dir) as server:
                 print(f"Synthetic lab receiver: http://{HOST}:{server.server_port}/lab/report", flush=True)
                 print(f"Dashboard: http://{HOST}:{server.server_port}/lab/dashboard", flush=True)
                 print(f"Event log: {server.store.log_path or 'in memory'}", flush=True)

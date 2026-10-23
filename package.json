@@ -2,18 +2,23 @@
   "name": "rieng-synthetic-browser-lab",
   "version": "1.0.0",
   "private": true,
-  "description": "Local-only browser testing of simulated device profiles and synthetic events",
+  "description": "Browser QA with configurable targets, device journeys, network profiles, metrics and traces",
   "scripts": {
     "start": "node scripts/python.cjs lab.py serve",
     "simulate": "node scripts/python.cjs lab.py simulate",
     "report": "node scripts/python.cjs lab.py report",
     "browser:lab": "node browser_lab.cjs",
+    "browser:install": "playwright install chromium firefox webkit",
+    "browser:check": "node scripts/check-browser.cjs",
     "test": "npm run test:python && npm run test:browser",
     "test:python": "node scripts/python.cjs -m unittest discover -s tests -v",
     "test:browser": "node --test tests/browser_lab.test.cjs"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "devDependencies": {
-    "playwright": "1.62.1"
+    "playwright": "1.62.1",
+    "web-vitals": "6.2.3"
   }
 }

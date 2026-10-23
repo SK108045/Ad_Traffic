@@ -6,11 +6,13 @@ const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { once } = require('node:events')
 const { python, root } = require('../scripts/python.cjs')
-const { options, profiles, launchBrowser, createContext, runLab } = require('../browser_lab.cjs')
+const { options, profiles, launchBrowser, createContext, runLab, runSession, finishContext } = require('../browser_lab.cjs')
+const { createServer, request: httpRequest } = require('node:http')
+const os = require('node:os')
 
 test('CLI parses profiles, repeated sessions, browser selection and headed mode', () => {
-  const config = options(['--profiles', 'ANDROID,iphone,android', '--browser', 'msedge', '--port', '1234', '--headed'])
-  assert.deepEqual(config.profiles, ['android', 'iphone', 'android'])
+  const config = options(['--profiles', 'ANDROID,desktop,android', '--browser', 'msedge', '--port', '1234', '--headed'])
+  assert.deepEqual(config.profiles, ['android', 'desktop', 'android'])
   assert.equal(config.browser, 'msedge')
   assert.equal(config.port, 1234)
   assert.equal(config.headed, true)
@@ -21,11 +23,61 @@ test('CLI parses profiles, repeated sessions, browser selection and headed mode'
 test('CLI rejects missing arguments, invalid limits and unsupported browsers', () => {
   for (const args of [['--profiles'], ['--port'], ['--browser'], ['--port', '--headed'],
     ['--port', '0'], ['--port', '65536'], ['--port', '1.2'], ['--port', 'NaN'],
-    ['--profiles', ''], ['--profiles', 'android,unknown'], ['--browser', 'firefox'],
+    ['--profiles', ''], ['--profiles', 'android,unknown'], ['--browser', 'unknown'],
     ['--unknown'], ['--profiles', Array(9).fill('desktop').join(',')]]) {
     assert.throws(() => options(args), undefined, args.join(' '))
   }
   assert.equal(options(['--profiles', Array(8).fill('desktop').join(',')]).profiles.length, 8)
+})
+
+test('target, matrix, engine, network and tracing configuration is validated', async () => {
+  assert.deepEqual(options([]).journeys, ['browse', 'history', 'mobile-menu', 'returning'])
+  assert.equal(options(['--profiles', 'desktop', '--browser', 'firefox']).browser, 'firefox')
+  const custom = options(['--target', 'https://staging.example.test/app/'])
+  assert.deepEqual(custom.journeys, ['smoke'])
+  assert.equal(custom.target.baseURL, 'https://staging.example.test/app/')
+  for (const mode of ['on', 'off', 'retain-on-failure']) assert.equal(options(['--trace', mode]).trace, mode)
+  for (const args of [['--trace'], ['--trace', 'bad'], ['--networks', 'bad'], ['--journeys', 'bad'],
+    ['--networks', 'native,native'], ['--journeys', 'smoke,smoke'], ['--timeout', 'NaN'],
+    ['--timeout', '0'], ['--concurrency', '9'], ['--concurrency', '1.5'], ['--target', 'file:///tmp'],
+    ['--target', 'https://user:password@example.test/'], ['--browser', 'firefox'],
+    ['--browser', 'chromium'], ['--target', 'https://example.test', '--journeys', 'history'],
+    ['--profiles', Array(8).fill('desktop').join(','), '--networks', 'native,fast-4g,slow-3g']]) {
+    assert.throws(() => options(args), undefined, args.join(' '))
+  }
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'lab-config-'))
+  const file = path.join(temp, 'target.json')
+  try {
+    await fs.writeFile(file, JSON.stringify({ baseURL: 'http://127.0.0.1:9000/app/',
+      allowedOrigins: ['https://assets.example.test'], routes: { home: './', shows: '/shows' }, selectors: { shows: 'a.shows' } }))
+    const config = options(['--config', file, '--journeys', 'history'])
+    assert.deepEqual(config.target.allowedOrigins, ['http://127.0.0.1:9000', 'https://assets.example.test'])
+    assert.equal(config.target.routes.home, './')
+    for (const value of [[], null, { baseURL: 'ftp://example.test' },
+      { baseURL: 'https://example.test', allowedOrigins: ['https://other.test/path'] },
+      { baseURL: 'https://example.test', routes: { home: 'https://other.test/' } },
+      { baseURL: 'https://example.test', selectors: { ready: null } }]) {
+      await fs.writeFile(file, JSON.stringify(value))
+      assert.throws(() => options(['--config', file]))
+    }
+    await fs.writeFile(file, '{broken')
+    assert.throws(() => options(['--config', file]))
+  } finally { await fs.rm(temp, { recursive: true, force: true }) }
+})
+
+test('tracing and cleanup failures produce failed results and still close contexts', async () => {
+  let closed = false
+  const failedTrace = { tracing: { stop: async () => { throw Error('disk full') } }, close: async () => { closed = true } }
+  const result = { status: 'passed' }
+  await finishContext(failedTrace, true, 'on', result, 'unused.zip')
+  assert.equal(closed, true)
+  assert.equal(result.status, 'failed')
+  assert.match(result.trace_error, /disk full/)
+  assert.equal(result.trace, undefined)
+  const cleanup = { status: 'passed' }
+  await finishContext({ close: async () => { throw Error('cleanup failed') } }, false, 'off', cleanup, 'unused.zip')
+  assert.equal(cleanup.status, 'failed')
+  assert.match(cleanup.error, /cleanup failed/)
 })
 
 async function startServer(log) {
@@ -61,6 +113,34 @@ async function json(url) {
   return response.json()
 }
 
+async function verifyTraceViewer(browser, trace) {
+  // This test intentionally uses the pinned viewer server shipped with Playwright.
+  const { startTraceViewerServer } = require('playwright-core/lib/coreBundle').server
+  const server = await startTraceViewerServer({ host: '127.0.0.1', port: 0,
+    allowedFileRoots: () => [path.dirname(trace)] })
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } })
+  try {
+    const page = await context.newPage(), errors = []
+    page.on('pageerror', error => errors.push(error.message))
+    const traceURL = `file?path=${encodeURIComponent(trace)}`
+    await page.goto(`${server.urlPrefix('precise')}/trace/index.html?trace=${encodeURIComponent(traceURL)}`)
+    await page.getByRole('treeitem').first().waitFor({ timeout: 30000 })
+    assert.ok(await page.getByRole('treeitem').count() > 0)
+    await page.getByRole('treeitem').filter({ hasText: 'Screenshot' }).first().click()
+    await page.waitForFunction(() => {
+      const scan = doc => [...doc.querySelectorAll('iframe')].some(frame => {
+        try {
+          const child = frame.contentDocument
+          return child && (child.body?.textContent.includes('SYNTHETIC / NO ADS') || scan(child))
+        } catch { return false }
+      })
+      return scan(document)
+    })
+    assert.deepEqual(errors, [])
+    await page.screenshot({ path: trace.replace(/\.zip$/, '-viewer.png'), fullPage: true })
+  } finally { await context.close(); await server.stop() }
+}
+
 test('real browser sessions, dashboard, artifacts, isolation and recovery', { timeout: 600000 }, async t => {
   const artifacts = path.join(root, 'artifacts')
   await fs.mkdir(artifacts, { recursive: true })
@@ -71,7 +151,7 @@ test('real browser sessions, dashboard, artifacts, isolation and recovery', { ti
   try {
     let first
     await t.test('four profiles play, pause, navigate, scroll, log events and save PNGs', async () => {
-      first = await runLab(options(['--port', String(port)]))
+      first = await runLab(options(['--port', String(port), '--journeys', 'browse']))
       assert.equal(first.status, 'passed')
       assert.equal(first.sessions.length, 4)
       assert.equal(first.report.total_events, 32)
@@ -97,7 +177,7 @@ test('real browser sessions, dashboard, artifacts, isolation and recovery', { ti
 
     await t.test('eight concurrent repeated profiles have unique identities across runs', async () => {
       const second = await runLab(options(['--port', String(port), '--profiles',
-        'desktop,android,iphone,tablet,desktop,android,iphone,tablet']))
+        'desktop,android,iphone,tablet,desktop,android,iphone,tablet', '--journeys', 'browse']))
       assert.equal(second.sessions.length, 8)
       assert.equal(second.report.total_events, 96)
       assert.equal(second.report.virtual_sessions, 12)
@@ -136,6 +216,25 @@ test('real browser sessions, dashboard, artifacts, isolation and recovery', { ti
       } finally { await context.close() }
     })
 
+    await t.test('explicit asset origins are allowed while other origins remain blocked', async () => {
+      const asset = createServer((request, response) => {
+        response.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' })
+        response.end('allowed asset')
+      })
+      asset.listen(0, '127.0.0.1')
+      await once(asset, 'listening')
+      const assetOrigin = `http://127.0.0.1:${asset.address().port}`
+      const context = await createContext(browser, 'desktop', base, { allowedOrigins: [base, assetOrigin] })
+      try {
+        const page = await context.newPage()
+        await page.goto(base)
+        assert.equal(await page.evaluate(async url => (await fetch(url)).text(), assetOrigin + '/asset'), 'allowed asset')
+        assert.equal(await page.evaluate(async () => {
+          try { await fetch('https://blocked.invalid/'); return false } catch { return true }
+        }), true)
+      } finally { await context.close(); await new Promise(resolve => asset.close(resolve)) }
+    })
+
     await t.test('dashboard refreshes totals, safely renders events, downloads reports and recovers', async () => {
       const context = await createContext(browser, 'android', base)
       try {
@@ -168,7 +267,9 @@ test('real browser sessions, dashboard, artifacts, isolation and recovery', { ti
         const runs = await json(base + '/lab/runs')
         const run = runs.runs.find(run => run.id === path.basename(first.output))
         assert.ok(run)
-        assert.equal((await fetch(base + run.summary_url)).status, 200)
+        const summaryResponse = await fetch(base + run.summary_url)
+        assert.equal(summaryResponse.status, 200)
+        assert.deepEqual(await summaryResponse.json(), first)
         for (const screenshot of run.screenshots) {
           const image = await fetch(base + screenshot.url)
           assert.equal(image.headers.get('content-type'), 'image/png')
@@ -193,6 +294,163 @@ test('real browser sessions, dashboard, artifacts, isolation and recovery', { ti
       assert.equal(events.length, report.total_events)
       assert.equal(events.length, 97)
       assert.ok(events.every(e => e.synthetic && e.observed_ip === '127.0.0.1'))
+    })
+
+    await t.test('all journeys exercise real WebKit, history, menus, returning storage and metrics', async () => {
+      const upgraded = await runLab(options(['--port', String(port)]))
+      assert.equal(upgraded.sessions.length, 16)
+      assert.equal(upgraded.sessions.filter(s => s.status === 'passed').length, 15)
+      assert.equal(upgraded.sessions.filter(s => s.status === 'skipped').length, 1)
+      for (const session of upgraded.sessions.filter(s => s.status === 'passed')) {
+        assert.equal(session.engine, ['iphone', 'tablet'].includes(session.profile) ? 'webkit' : 'chromium')
+        assert.ok(session.documents.length >= 1)
+        assert.ok(session.transitions.every(t => t.duration_ms > 0 && t.to.startsWith(base)))
+        for (const doc of session.documents) {
+          assert.ok(doc.navigation.ttfb_ms >= 0)
+          assert.ok(doc.navigation.load_ms > 0)
+          for (const name of ['LCP', 'CLS', 'INP']) {
+            assert.ok(['measured', 'no-data', 'unsupported'].includes(doc.vitals[name].status))
+            assert.equal(doc.vitals[name].status === 'measured', typeof doc.vitals[name].value === 'number')
+          }
+        }
+        if (session.journey === 'history') {
+          assert.deepEqual(session.transitions.map(t => t.action), ['landing', 'history-shows', 'history-back', 'history-forward', 'history-reload'])
+        }
+        if (session.journey === 'returning') {
+          assert.deepEqual(session.returning_session, { cookies_restored: true, local_storage_restored: true, session_storage_fresh: true })
+          assert.equal(session.documents.length, 2)
+        }
+        assert.equal(session.trace, undefined)
+      }
+      assert.equal((await fs.readdir(upgraded.output)).some(name => name.endsWith('.zip')), false)
+      const browse = upgraded.sessions.find(s => s.profile === 'desktop' && s.journey === 'browse')
+      assert.ok(browse.documents.some(d => d.vitals.LCP.status === 'measured'))
+      assert.ok(browse.documents.some(d => d.vitals.CLS.status === 'measured'))
+    })
+
+    await t.test('Firefox desktop runs browse, history and returning journeys', async () => {
+      const summary = await runLab(options(['--port', String(port), '--profiles', 'desktop', '--browser', 'firefox']))
+      assert.ok(summary.sessions.filter(s => s.status === 'passed').every(s => s.engine === 'firefox'))
+      assert.equal(summary.sessions.filter(s => s.status === 'passed').length, 3)
+      assert.ok(summary.browsers.firefox)
+    })
+
+    await t.test('all three engines apply network profiles and verify offline recovery', async () => {
+      for (const args of [['--profiles', 'desktop,iphone'], ['--profiles', 'desktop', '--browser', 'firefox']]) {
+        const summary = await runLab(options(['--port', String(port), '--journeys', 'smoke',
+          '--networks', 'native,fast-4g,slow-3g,offline', '--trace', 'on', ...args]))
+        for (const session of summary.sessions) {
+          assert.equal(session.status, 'passed')
+          if (session.network.name === 'offline') assert.equal(session.offline_verified, true)
+          else if (session.network.name !== 'native') {
+            assert.equal(session.network.method, session.engine === 'chromium' ? 'chromium-cdp' : 'per-response-delay')
+            assert.ok(session.transitions[0].duration_ms >= session.network.latency)
+          }
+        }
+        for (const session of summary.sessions.filter(s => s.network.name === 'native')) {
+          await verifyTraceViewer(browser, session.trace)
+        }
+      }
+    })
+
+    await t.test('a separate configured target receives no receiver telemetry requests', async () => {
+      const requests = []
+      const external = createServer((request, response) => {
+        requests.push(request.url)
+        response.writeHead(200, { 'Content-Type': 'text/html' })
+        response.end('<!doctype html><meta name="viewport" content="width=device-width"><main><h1>Separate target</h1><a data-shows href="/section/">Section</a></main>')
+      })
+      external.listen(0, '127.0.0.1')
+      await once(external, 'listening')
+      try {
+        const target = `http://127.0.0.1:${external.address().port}/app/`
+        const summary = await runLab(options(['--port', String(port), '--target', target, '--profiles', 'desktop']))
+        assert.equal(summary.sessions[0].journey, 'smoke')
+        assert.equal(summary.sessions[0].documents[0].url, target)
+        assert.ok(requests.includes('/app/'))
+        assert.ok(requests.every(url => !url.startsWith('/lab/')))
+        assert.equal(summary.sessions[0].actions.length, 3)
+        const configFile = path.join(temp, 'external-target.json')
+        await fs.writeFile(configFile, JSON.stringify({ name: 'Independent target', baseURL: target,
+          routes: { home: '/app/', shows: '/section/' }, selectors: { ready: 'main', shows: '[data-shows]' } }))
+        const configured = await runLab(options(['--port', String(port), '--config', configFile,
+          '--profiles', 'desktop', '--journeys', 'history,returning']))
+        assert.equal(configured.sessions.length, 2)
+        assert.equal(configured.sessions[0].transitions[2].to, target)
+        assert.equal(configured.sessions[1].returning_session.cookies_restored, true)
+        assert.ok(requests.includes('/section/'))
+        assert.ok(requests.every(url => !url.startsWith('/lab/')))
+      } finally { await new Promise(resolve => external.close(resolve)) }
+    })
+
+    await t.test('traces are retained on success, discarded when off, and downloadable without corruption', async () => {
+      const summary = await runLab(options(['--port', String(port), '--profiles', 'desktop', '--journeys', 'smoke,returning', '--trace', 'on']))
+      assert.equal(summary.sessions[1].traces.length, 2)
+      assert.equal((await fs.readdir(summary.output)).filter(n => n.endsWith('.zip')).length, 4)
+      const runs = (await json(base + '/lab/runs')).runs
+      const run = runs.find(r => r.id === path.basename(summary.output))
+      assert.equal(run.traces.length, 4)
+      for (const trace of run.traces) {
+        const response = await fetch(base + trace.url)
+        assert.equal(response.headers.get('content-type'), 'application/zip')
+        assert.match(response.headers.get('content-disposition'), /^attachment; filename=".*\.zip"$/)
+        const bytes = Buffer.from(await response.arrayBuffer())
+        assert.equal(bytes.subarray(0, 2).toString(), 'PK')
+        assert.deepEqual(bytes, await fs.readFile(path.join(summary.output, decodeURIComponent(trace.url.split('/').at(-1)))))
+      }
+      const downloadContext = await createContext(browser, 'desktop', base)
+      try {
+        const page = await downloadContext.newPage()
+        await page.goto(base + '/lab/dashboard')
+        const traceLink = page.locator(`#runs a[href="${run.traces[0].url}"]`)
+        await traceLink.waitFor()
+        const [download] = await Promise.all([page.waitForEvent('download'), traceLink.click()])
+        assert.ok(download.suggestedFilename().endsWith('.zip'))
+        const original = path.join(summary.output, decodeURIComponent(run.traces[0].url.split('/').at(-1)))
+        assert.deepEqual(await fs.readFile(await download.path()), await fs.readFile(original))
+        await page.getByText('Journey results and performance', { exact: true }).first().click()
+        assert.ok((await page.locator('#runs details').first().innerText()).includes('returning'))
+      } finally { await downloadContext.close() }
+      const off = await runLab(options(['--port', String(port), '--profiles', 'desktop', '--journeys', 'smoke', '--trace', 'off']))
+      assert.equal(off.sessions[0].trace, undefined)
+      assert.equal((await fs.readdir(off.output)).some(n => n.endsWith('.zip')), false)
+      const failed = await runSession(browser, 'desktop', 1, base + '/missing', temp, 'traced-failure', { timeout: 1000 })
+      assert.equal(failed.status, 'failed')
+      assert.ok((await fs.stat(failed.trace)).size > 1000)
+      const failedOff = await runSession(browser, 'desktop', 1, base + '/missing', temp, 'untraced-failure', { trace: 'off', timeout: 1000 })
+      assert.equal(failedOff.trace, undefined)
+      await verifyTraceViewer(browser, summary.sessions[0].trace)
+    })
+
+    await t.test('a failed dashboard retains its trace and a failed run summary', async () => {
+      const proxy = createServer((incoming, outgoing) => {
+        if (incoming.url === '/lab/dashboard') {
+          outgoing.writeHead(503, { 'Content-Type': 'text/html' })
+          outgoing.end('<p id="status">Dashboard unavailable</p>')
+          return
+        }
+        const forwarded = httpRequest(base + incoming.url, { method: incoming.method, headers: incoming.headers }, response => {
+          outgoing.writeHead(response.statusCode, response.headers)
+          response.pipe(outgoing)
+        })
+        forwarded.on('error', error => outgoing.destroy(error))
+        incoming.pipe(forwarded)
+      })
+      proxy.listen(0, '127.0.0.1')
+      await once(proxy, 'listening')
+      try {
+        let failure
+        try {
+          await runLab(options(['--port', String(proxy.address().port), '--target', base,
+            '--profiles', 'desktop', '--timeout', '1000']))
+        } catch (error) { failure = error }
+        assert.ok(failure?.summary)
+        assert.equal(failure.summary.status, 'failed')
+        assert.equal(failure.summary.sessions[0].status, 'passed')
+        assert.equal(failure.summary.sessions[0].trace, undefined)
+        assert.ok((await fs.stat(failure.summary.dashboard_trace)).size > 1000)
+        assert.equal(JSON.parse(await fs.readFile(path.join(failure.summary.output, 'summary.json'))).status, 'failed')
+      } finally { await new Promise(resolve => proxy.close(resolve)) }
     })
   } finally {
     if (browser) await browser.close()

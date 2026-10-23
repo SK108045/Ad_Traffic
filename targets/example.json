@@ -1,0 +1,21 @@
+{
+  "name": "My staging site",
+  "baseURL": "http://127.0.0.1:9000/",
+  "allowedOrigins": [],
+  "routes": {
+    "home": "/",
+    "shows": "/shows",
+    "trending": "/trending",
+    "videos": "/videos"
+  },
+  "selectors": {
+    "ready": "main",
+    "play": "#tune-in",
+    "playerState": "#player-state",
+    "menu": "#menu-toggle",
+    "navigation": "#site-nav",
+    "shows": "#schedule-link",
+    "trending": "#site-nav a[href=\"/trending\"]",
+    "videos": "#site-nav a[href=\"/videos\"]"
+  }
+}

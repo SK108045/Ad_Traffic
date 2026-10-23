@@ -24,7 +24,7 @@
   <div class="grid"><div class="metric"><span class="label">Events received</span><strong id="events">—</strong></div><div class="metric"><span class="label">Virtual sessions</span><strong id="sessions">—</strong></div><div class="metric"><span class="label">Observed IPs</span><strong id="ips">—</strong></div></div>
   <div class="columns"><section class="panel"><h2>Claimed device types</h2><div id="devices"></div></section><section class="panel"><h2>Recorded actions</h2><div id="actions"></div></section></div>
   <section class="panel" style="margin-top:1rem"><h2>Latest events</h2><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Session</th><th>Claimed device</th><th>Observed IP</th><th>Action</th><th>Page</th></tr></thead><tbody id="rows"></tbody></table></div></section>
-  <section class="panel" style="margin-top:1rem"><h2>Browser runs and screenshots</h2><div id="runs">No browser runs yet</div></section>
+  <section class="panel" style="margin-top:1rem"><h2>Browser runs, screenshots and traces</h2><div id="runs">No browser runs yet</div></section>
   <p class="sub" id="status" role="status" aria-live="polite">Waiting for local lab events…</p>
 </main><script>
   const $ = id => document.getElementById(id);
@@ -46,10 +46,26 @@
     for(const run of runs){
       const row=document.createElement('div');row.className='run';
       const title=document.createElement('p');title.textContent=`${run.id} · ${run.browser} · ${run.status} · ${run.session_count} sessions`;
+      const description=document.createElement('p');description.className='subtle';description.textContent=run.target||'Bundled staging site';
       const links=document.createElement('div');links.className='links';
-      for(const item of [{profile:'JSON summary',url:run.summary_url},...run.screenshots]){
-        const link=document.createElement('a');link.textContent=item.label||item.profile;link.href=item.url;link.target='_blank';link.rel='noopener';links.append(link);
-      }row.append(title,links);target.append(row);
+      for(const item of [{profile:'JSON summary',url:run.summary_url},...run.screenshots,...(run.traces||[])]){
+        const link=document.createElement('a');link.textContent=item.label||item.profile;link.href=item.url;
+        if(item.url.endsWith('.zip'))link.download='';else{link.target='_blank';link.rel='noopener';}links.append(link);
+      }
+      row.append(title,description,links);
+      const detail=document.createElement('details'),summary=document.createElement('summary');summary.textContent='Journey results and performance';detail.append(summary);
+      const wrap=document.createElement('div');wrap.className='table-wrap';
+      const table=document.createElement('table'),head=document.createElement('thead'),heading=document.createElement('tr');
+      for(const label of ['Profile','Engine','Journey','Network','Status','Transition avg (ms)','LCP (ms)','CLS','INP (ms)']){const cell=document.createElement('th');cell.textContent=label;heading.append(cell);}head.append(heading);table.append(head);
+      const body=document.createElement('tbody');
+      for(const session of run.sessions||[]){
+        const tr=document.createElement('tr'),transitions=session.transitions||[],documents=session.documents||[];
+        const metric=name=>{const values=documents.map(d=>d.vitals?.[name]).filter(Boolean);const measured=values.filter(m=>m.status==='measured');const last=measured.at(-1);return last?Number(last.value.toFixed(name==='CLS'?4:1)):values.at(-1)?.status||'no-data';};
+        const average=transitions.length?(transitions.reduce((n,t)=>n+t.duration_ms,0)/transitions.length).toFixed(1):'—';
+        for(const value of [session.profile,session.engine||'—',session.journey||'browse',session.network?.name||session.network||'native',session.status,average,metric('LCP'),metric('CLS'),metric('INP')]){const cell=document.createElement('td');cell.textContent=String(value);tr.append(cell);}
+        body.append(tr);
+      }
+      table.append(body);wrap.append(table);detail.append(wrap);row.append(detail);target.append(row);
     }
   }
   async function refresh(){
