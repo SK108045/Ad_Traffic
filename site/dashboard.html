@@ -12,17 +12,20 @@
     .metric strong{font-size:2.5rem;display:block;line-height:1.2;margin-top:.5rem}.label{color:#a5adbd;font-size:.8rem}
     .columns{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.panel h2{margin:0 0 1.3rem;font-size:1.1rem}
     .bar-row{margin:1rem 0}.bar-label{display:flex;justify-content:space-between;color:#bbc3d2;font-size:.84rem;margin-bottom:.35rem}.track{height:10px;border-radius:20px;background:#272d38;overflow:hidden}.fill{height:100%;background:linear-gradient(90deg,#ff713f,#ffb46b);border-radius:20px}
-    table{width:100%;border-collapse:collapse;font-size:.83rem}th{text-align:left;color:#8e98ad;font-weight:600}td,th{padding:.8rem;border-bottom:1px solid #29303b}td{word-break:break-word}.table-wrap{overflow-x:auto}.subtle{color:#98a2b4}
+    table{width:100%;min-width:900px;border-collapse:collapse;font-size:.83rem}th{text-align:left;color:#8e98ad;font-weight:600}td,th{padding:.8rem;border-bottom:1px solid #29303b;white-space:nowrap}.table-wrap{overflow-x:auto}.subtle{color:#98a2b4}
+    a{color:#ffb46b}a:focus-visible{outline:3px solid #ffb46b;outline-offset:3px}.links{display:flex;gap:1rem;flex-wrap:wrap}.run{padding:1rem 0;border-top:1px solid #29303b}.run p{margin:.3rem 0 .8rem;overflow-wrap:anywhere}#status[data-state="error"]{color:#ff9a89}
     @media(max-width:720px){.grid{grid-template-columns:1fr}.columns{grid-template-columns:1fr}}
   </style>
 </head>
 <body><main>
   <div class="top"><div><p class="label">LOCAL TRAFFIC RESEARCH</p><h1>Device lab dashboard</h1></div><span class="badge">● SYNTHETIC EVENTS ONLY</span></div>
-  <p class="sub">Explore claimed device identities versus observed connection data. Auto-updates every two seconds. No production advertising metrics are collected.</p>
+  <p class="sub">Explore claimed device identities versus observed connection data. Auto-updates every two seconds. Totals cover the latest 5,000 events; the full event log is saved locally.</p>
+  <div class="links"><a href="/">Open staging site</a><a id="download-report" href="/lab/report?download=1" download="lab-report.json">Download JSON report</a></div>
   <div class="grid"><div class="metric"><span class="label">Events received</span><strong id="events">—</strong></div><div class="metric"><span class="label">Virtual sessions</span><strong id="sessions">—</strong></div><div class="metric"><span class="label">Observed IPs</span><strong id="ips">—</strong></div></div>
   <div class="columns"><section class="panel"><h2>Claimed device types</h2><div id="devices"></div></section><section class="panel"><h2>Recorded actions</h2><div id="actions"></div></section></div>
   <section class="panel" style="margin-top:1rem"><h2>Latest events</h2><div class="table-wrap"><table><thead><tr><th>Time (UTC)</th><th>Session</th><th>Claimed device</th><th>Observed IP</th><th>Action</th><th>Page</th></tr></thead><tbody id="rows"></tbody></table></div></section>
-  <p class="sub" id="status">Waiting for local lab events…</p>
+  <section class="panel" style="margin-top:1rem"><h2>Browser runs and screenshots</h2><div id="runs">No browser runs yet</div></section>
+  <p class="sub" id="status" role="status" aria-live="polite">Waiting for local lab events…</p>
 </main><script>
   const $ = id => document.getElementById(id);
   function bars(target, counts) {
@@ -37,10 +40,24 @@
       track.append(fill);row.append(head,track);target.append(row);
     }
   }
+  function renderRuns(runs){
+    const target=$('runs');target.replaceChildren();
+    if(!runs.length){target.textContent='No browser runs yet';return;}
+    for(const run of runs){
+      const row=document.createElement('div');row.className='run';
+      const title=document.createElement('p');title.textContent=`${run.id} · ${run.browser} · ${run.status} · ${run.session_count} sessions`;
+      const links=document.createElement('div');links.className='links';
+      for(const item of [{profile:'JSON summary',url:run.summary_url},...run.screenshots]){
+        const link=document.createElement('a');link.textContent=item.label||item.profile;link.href=item.url;link.target='_blank';link.rel='noopener';links.append(link);
+      }row.append(title,links);target.append(row);
+    }
+  }
   async function refresh(){
     try{
-      const response=await fetch('/lab/report',{cache:'no-store'});if(!response.ok)throw Error(response.status);
-      const data=await response.json();$('events').textContent=data.total_events.toLocaleString();
+      const [data,history]=await Promise.all(['/lab/report','/lab/runs'].map(async url=>{
+        const response=await fetch(url,{cache:'no-store',signal:AbortSignal.timeout(5000)});
+        if(!response.ok)throw Error(`HTTP ${response.status}`);return response.json();
+      }));$('events').textContent=data.total_events.toLocaleString();
       $('sessions').textContent=data.virtual_sessions.toLocaleString();$('ips').textContent=Object.keys(data.by_observed_ip).length;
       bars($('devices'),data.by_claimed_device);bars($('actions'),data.by_action);
       $('rows').replaceChildren();for(const e of [...data.recent_events].reverse()){
@@ -48,8 +65,11 @@
           const td=document.createElement('td');td.textContent=String(value??'');tr.append(td);
         }$('rows').append(tr);
       }
+      renderRuns(history.runs);
+      $('status').dataset.state='ok';
       $('status').textContent=`Last updated ${new Date().toLocaleTimeString()} · Local test data only`;
-    }catch(error){$('status').textContent=`Lab server unavailable: ${error.message}`;}
+    }catch(error){$('status').dataset.state='error';$('status').textContent=`Lab server unavailable: ${error.message}`;}
+    finally{setTimeout(refresh,2000);}
   }
-  refresh();setInterval(refresh,2000);
+  refresh();
 </script></body></html>

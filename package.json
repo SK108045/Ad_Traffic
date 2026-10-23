@@ -4,8 +4,15 @@
   "private": true,
   "description": "Local-only browser testing of simulated device profiles and synthetic events",
   "scripts": {
-    "browser:lab": "node browser_lab.cjs"
+    "start": "node scripts/python.cjs lab.py serve",
+    "simulate": "node scripts/python.cjs lab.py simulate",
+    "report": "node scripts/python.cjs lab.py report",
+    "browser:lab": "node browser_lab.cjs",
+    "test": "npm run test:python && npm run test:browser",
+    "test:python": "node scripts/python.cjs -m unittest discover -s tests -v",
+    "test:browser": "node --test tests/browser_lab.test.cjs"
   },
+  "engines": { "node": ">=20" },
   "devDependencies": {
     "playwright": "1.62.1"
   }
