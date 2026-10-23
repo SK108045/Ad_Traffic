@@ -1,0 +1,12 @@
+{
+  "name": "rieng-synthetic-browser-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local-only browser testing of simulated device profiles and synthetic events",
+  "scripts": {
+    "browser:lab": "node browser_lab.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
