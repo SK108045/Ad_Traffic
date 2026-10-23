@@ -98,6 +98,29 @@ Returning-session state stays in memory and is scoped to one journey. Separate
 virtual identities never share it. This checks browser storage persistence, not
 an application's account/login flow.
 
+## Test the actual RIENG Radio app locally
+
+The repository includes `targets/rieng-local.json`, copied from the current
+`SK108045/Radio` component structure. It uses the real navbar links, mobile menu
+button, `#live-player` controls and the current player status messages.
+
+Start the Radio repo locally first (normally on port 3000), with the Catfish/ad
+integration disabled for QA. Then run:
+
+```powershell
+npm.cmd run browser:lab -- --config targets\rieng-local.json --profiles desktop,android,iphone --journeys browse,history,mobile-menu,returning --headed --concurrency 1
+```
+
+For a smaller first check:
+
+```powershell
+npm.cmd run browser:lab -- --config targets\rieng-local.json --profiles desktop,android --journeys browse --headed --concurrency 1
+```
+
+If your local Radio app uses another port, copy `targets/rieng-local.json` and
+change only `baseURL`. The selectors currently match `components/Navbar.tsx`
+and `components/LivePlayer.tsx` in the Radio repository.
+
 ## Configure another target
 
 Keep the receiver running. A URL uses the generic `smoke` journey by default:
